@@ -1,5 +1,3 @@
-package com.newrelic.nrvideoproject;
-
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.media3.common.MediaItem;
 import androidx.media3.exoplayer.ExoPlayer;
