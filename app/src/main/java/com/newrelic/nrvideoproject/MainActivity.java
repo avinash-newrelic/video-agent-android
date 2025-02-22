@@ -1,4 +1,4 @@
-
+package com.newrelic.nrvideoproject;
 
 import androidx.appcompat.app.AppCompatActivity;
 import android.content.Intent;

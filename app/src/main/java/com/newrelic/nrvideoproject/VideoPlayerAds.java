@@ -1,3 +1,5 @@
+package com.newrelic.nrvideoproject;
+
 import android.net.Uri;
 import android.os.Bundle;
 import com.google.ads.interactivemedia.v3.api.AdErrorEvent;
