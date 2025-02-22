@@ -6,6 +6,7 @@ android {
     compileSdkVersion 33
 
     defaultConfig {
+        applicationId "com.avinash.newrelic.nrvideoproject"
         minSdkVersion 16
         targetSdkVersion 33
         versionCode 2
@@ -30,7 +31,7 @@ android {
     packagingOptions {
         exclude("META-INF/*.kotlin_module")
     }
-    
+    namespace 'com.avinash.newrelic.nrvideoproject'
 }
 
 dependencies {
