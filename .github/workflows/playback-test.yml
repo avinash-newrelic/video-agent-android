@@ -157,6 +157,14 @@ jobs:
 
           # ----- install APK -----
           adb wait-for-device
+          # Uninstall any previous install first. Necessary because cached
+          # AVD snapshots persist installed apps across runs, and if a
+          # previous run built with a different signing config (e.g. an
+          # earlier assembleRelease → unsigned, or a later assembleDebug →
+          # debug keystore) then `adb install -r` fails with
+          # INSTALL_FAILED_UPDATE_INCOMPATIBLE. The uninstall is a no-op
+          # when the package isn't already there.
+          adb uninstall "$APP_PKG" >/dev/null 2>&1 || true
           adb install -r -g "$APK_PATH"
 
           # Grant common runtime permissions preemptively so a permission
