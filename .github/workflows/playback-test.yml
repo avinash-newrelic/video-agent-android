@@ -138,6 +138,121 @@ jobs:
           disable-animations: true
           script: echo "Snapshot primed"
 
+      # reactivecircus/android-emulator-runner runs its `script:` input
+      # through @actions/exec by splitting on newlines and invoking `sh -c`
+      # once per line, so shell state (variables, loops, `if`) doesn't
+      # persist between lines. The workaround is to write the playback
+      # logic to a file here — where a normal `run:` step gets a real
+      # bash session — and have the emulator step just invoke that file.
+      - name: Prepare playback script
+        run: |
+          cat > /tmp/playback.sh <<'PLAYBACK_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          OUT_DIR="$GITHUB_WORKSPACE/playback-out"
+          mkdir -p "$OUT_DIR"
+          SUMMARY="$OUT_DIR/SUMMARY.txt"
+          : > "$SUMMARY"
+
+          # ----- install APK -----
+          adb wait-for-device
+          adb install -r -g "$APK_PATH"
+
+          # Grant common runtime permissions preemptively so a permission
+          # dialog can't stall a scenario.
+          for perm in POST_NOTIFICATIONS READ_MEDIA_VIDEO READ_EXTERNAL_STORAGE; do
+            adb shell pm grant "$APP_PKG" "android.permission.$perm" 2>/dev/null || true
+          done
+
+          # ----- start logcat capture in background -----
+          adb logcat -c
+          adb logcat -v time > "$OUT_DIR/logcat.log" &
+          LOGCAT_PID=$!
+          trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT
+
+          # ----- resolve app's external files dir -----
+          APP_EXT_DIR="/sdcard/Android/data/$APP_PKG/files"
+
+          # ----- flatten NR overrides into `am start` extras -----
+          # Extra-name convention matches iOS's ProcessInfo env-var reads
+          # exactly (NEW_RELIC_HARVEST_CYCLE_SECS etc.), so the same
+          # nr_overrides JSON forwarded from playback-master applies
+          # symmetrically to both platforms.
+          EXTRAS=""
+          if [ -n "${NR_OVERRIDES:-}" ] && [ "$NR_OVERRIDES" != "{}" ]; then
+            while IFS='=' read -r k v; do
+              key_upper=$(echo "$k" | tr '[:lower:]' '[:upper:]')
+              EXTRAS+=" -e NEW_RELIC_${key_upper} \"$v\""
+            done < <(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+          fi
+
+          # ----- iterate scenarios -----
+          for SCENARIO in $(echo "$SCENARIOS_JSON" | jq -r '.[]'); do
+            SCEN_DIR="$OUT_DIR/$SCENARIO"
+            mkdir -p "$SCEN_DIR"
+            LOG_ON_DEVICE="$APP_EXT_DIR/logs/auto-play-$SCENARIO.log"
+
+            # Wipe last run's log if any (idempotent scenario start).
+            adb shell rm -f "$LOG_ON_DEVICE" 2>/dev/null || true
+
+            # Collector override is a per-scenario intent extra rather than
+            # a build-time constant so the same APK can be pointed at
+            # staging vs prod without a rebuild. Empty value → the app
+            # falls through to the NRVA default (prod collector).
+            COLLECTOR_EXTRA=""
+            if [ -n "${COLLECTOR_ADDRESS:-}" ]; then
+              COLLECTOR_EXTRA="-e NEW_RELIC_COLLECTOR_ADDRESS \"$COLLECTOR_ADDRESS\""
+            fi
+
+            # Force-stop the app so each scenario boots clean, then dispatch.
+            adb shell am force-stop "$APP_PKG" || true
+            adb shell am start -W -n "$APP_PKG/$APP_ACTIVITY" \
+              -e SCENARIO_ID "$SCENARIO" \
+              -e LEG_TAG "$LEG_TAG" \
+              -e NRVA_VERSION "$NRVA_VERSION" \
+              -e RUN_ID "$RUN_ID" \
+              -e TRIGGER_TIME "$TRIGGER_TIME" \
+              -e GIT_SHA "$GIT_SHA" \
+              $COLLECTOR_EXTRA \
+              $EXTRAS > /dev/null
+
+            # Poll for the DONE sentinel with a hard cap.
+            STATUS="timeout"
+            ELAPSED=0
+            while [ $ELAPSED -lt $SCENARIO_TIMEOUT ]; do
+              if adb shell "test -f $LOG_ON_DEVICE && grep -q 'SCENARIO_DONE:' $LOG_ON_DEVICE" 2>/dev/null; then
+                STATUS="ok"
+                break
+              fi
+              sleep 3
+              ELAPSED=$((ELAPSED + 3))
+            done
+
+            # Pull artifacts. `adb pull` fails silently if the file is
+            # absent; that's fine — we already recorded the timeout.
+            adb pull "$LOG_ON_DEVICE" "$SCEN_DIR/auto-play-$SCENARIO.log" 2>/dev/null || true
+            adb exec-out screencap -p > "$SCEN_DIR/screenshot.png" || true
+
+            # Extract viewId from the log's first line, if present.
+            VIEW_ID="(not-found)"
+            if [ -f "$SCEN_DIR/auto-play-$SCENARIO.log" ]; then
+              FOUND=$(grep -m1 -oE 'VIEW_ID:[A-Za-z0-9-]+' "$SCEN_DIR/auto-play-$SCENARIO.log" \
+                | head -1 | cut -d: -f2- || true)
+              VIEW_ID="${FOUND:-(not-found)}"
+            fi
+
+            printf '%s|%s|%s|%s\n' "$STATUS" "$ELAPSED" "$SCENARIO" "$VIEW_ID" >> "$SUMMARY"
+          done
+
+          # ----- always exit 0 -----
+          # This workflow is a *generator*, not a validator. A timeout is
+          # not a workflow failure: the partial telemetry the app already
+          # sent to New Relic is still useful. See "generator, not
+          # validator" in README.md.
+          PLAYBACK_SCRIPT
+          chmod +x /tmp/playback.sh
+
       - name: Run playback scenarios in emulator
         uses: reactivecircus/android-emulator-runner@v2
         env:
@@ -158,124 +273,10 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -no-boot-anim -no-audio -no-snapshot-save
           disable-animations: true
-          # reactivecircus/android-emulator-runner executes `script:` via
-          # /bin/sh, which on ubuntu-latest is dash. Dash rejects `set -o
-          # pipefail`, the `${var// /}` parameter-expansion pattern, `+=`
-          # string concatenation, and `< <(...)` process substitution — so
-          # this block stays POSIX. We `set -eu` (no pipefail) and
-          # substitute `while ... | pipe` for process substitution.
-          script: |
-            set -eu
-
-            OUT_DIR="playback-out"
-            mkdir -p "$OUT_DIR"
-            SUMMARY="$OUT_DIR/SUMMARY.txt"
-            : > "$SUMMARY"
-
-            # ----- install APK -----
-            adb wait-for-device
-            adb install -r -g "$APK_PATH"
-
-            # Grant common runtime permissions preemptively so a permission
-            # dialog can't stall a scenario.
-            for perm in POST_NOTIFICATIONS READ_MEDIA_VIDEO READ_EXTERNAL_STORAGE; do
-              adb shell pm grant "$APP_PKG" "android.permission.$perm" 2>/dev/null || true
-            done
-
-            # ----- start logcat capture in background -----
-            adb logcat -c
-            adb logcat -v time > "$OUT_DIR/logcat.log" &
-            LOGCAT_PID=$!
-            trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT
-
-            # ----- resolve app's external files dir -----
-            # This is where the sample app writes auto-play-<scenario>.log.
-            APP_EXT_DIR="/sdcard/Android/data/$APP_PKG/files"
-
-            # ----- flatten NR overrides into `am start` extras -----
-            # Extra-name convention matches iOS's ProcessInfo env-var reads
-            # exactly (NEW_RELIC_HARVEST_CYCLE_SECS etc.), so the same
-            # nr_overrides JSON forwarded from playback-master applies
-            # symmetrically to both platforms. Nothing else in the sample
-            # app reads NEW_RELIC_* — it's a namespace shared with the
-            # native NR SDK's env-based config.
-            EXTRAS=""
-            NR_OVERRIDES_TRIMMED=$(echo "${NR_OVERRIDES:-}" | tr -d ' ')
-            if [ -n "$NR_OVERRIDES_TRIMMED" ] && [ "$NR_OVERRIDES_TRIMMED" != "{}" ]; then
-              # Piped `while` runs in a subshell in POSIX sh — that's why the
-              # accumulated EXTRAS string is captured via command substitution
-              # of the loop output rather than assignment inside the loop.
-              EXTRAS=$(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while IFS='=' read -r k v; do
-                key_upper=$(echo "$k" | tr '[:lower:]' '[:upper:]')
-                printf ' -e NEW_RELIC_%s "%s"' "$key_upper" "$v"
-              done)
-            fi
-
-            # ----- iterate scenarios -----
-            for SCENARIO in $(echo "$SCENARIOS_JSON" | jq -r '.[]'); do
-              SCEN_DIR="$OUT_DIR/$SCENARIO"
-              mkdir -p "$SCEN_DIR"
-              LOG_ON_DEVICE="$APP_EXT_DIR/logs/auto-play-$SCENARIO.log"
-
-              # Wipe last run's log if any (idempotent scenario start).
-              adb shell rm -f "$LOG_ON_DEVICE" 2>/dev/null || true
-
-              # Collector override is a per-scenario intent extra rather than
-              # a build-time constant so the same APK can be pointed at
-              # staging vs prod without a rebuild. Empty value → the app
-              # falls through to the NRVA default (prod collector).
-              COLLECTOR_EXTRA=""
-              if [ -n "${COLLECTOR_ADDRESS:-}" ]; then
-                COLLECTOR_EXTRA="-e NEW_RELIC_COLLECTOR_ADDRESS \"$COLLECTOR_ADDRESS\""
-              fi
-
-              # Force-stop the app so each scenario boots clean, then dispatch.
-              adb shell am force-stop "$APP_PKG" || true
-              adb shell am start -W -n "$APP_PKG/$APP_ACTIVITY" \
-                -e SCENARIO_ID "$SCENARIO" \
-                -e LEG_TAG "$LEG_TAG" \
-                -e NRVA_VERSION "$NRVA_VERSION" \
-                -e RUN_ID "$RUN_ID" \
-                -e TRIGGER_TIME "$TRIGGER_TIME" \
-                -e GIT_SHA "$GIT_SHA" \
-                $COLLECTOR_EXTRA \
-                $EXTRAS > /dev/null
-
-              # Poll for the DONE sentinel with a hard cap. Save whatever
-              # log content we captured either way — a partial log is often
-              # enough to see where the app got stuck.
-              STATUS="timeout"
-              ELAPSED=0
-              while [ $ELAPSED -lt $SCENARIO_TIMEOUT ]; do
-                if adb shell "test -f $LOG_ON_DEVICE && grep -q 'SCENARIO_DONE:' $LOG_ON_DEVICE" 2>/dev/null; then
-                  STATUS="ok"
-                  break
-                fi
-                sleep 3
-                ELAPSED=$((ELAPSED + 3))
-              done
-
-              # Pull artifacts. `adb pull` fails silently if the file is
-              # absent; that's fine — we already recorded the timeout.
-              adb pull "$LOG_ON_DEVICE" "$SCEN_DIR/auto-play-$SCENARIO.log" 2>/dev/null || true
-              adb exec-out screencap -p > "$SCEN_DIR/screenshot.png" || true
-
-              # Extract viewId from the log's first line, if present.
-              VIEW_ID="(not-found)"
-              if [ -f "$SCEN_DIR/auto-play-$SCENARIO.log" ]; then
-                VIEW_ID=$(grep -m1 -oE 'VIEW_ID:[A-Za-z0-9-]+' "$SCEN_DIR/auto-play-$SCENARIO.log" \
-                  | head -1 | cut -d: -f2- || true)
-                VIEW_ID="${VIEW_ID:-(not-found)}"
-              fi
-
-              printf '%s|%s|%s|%s\n' "$STATUS" "$ELAPSED" "$SCENARIO" "$VIEW_ID" >> "$SUMMARY"
-            done
-
-            # ----- always exit 0 -----
-            # This workflow is a *generator*, not a validator. A timeout is
-            # not a workflow failure: the partial telemetry the app already
-            # sent to New Relic is still useful. Failing the job here would
-            # obscure that signal. See "generator, not validator" in README.md.
+          # One-line invocation so the action's per-line sh -c splitter has
+          # nothing to split on — all real logic lives in /tmp/playback.sh
+          # written in the "Prepare playback script" step.
+          script: bash /tmp/playback.sh
 
       - name: Upload playback artifact
         if: always()
