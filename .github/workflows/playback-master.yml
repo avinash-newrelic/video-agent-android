@@ -188,6 +188,10 @@ jobs:
       trigger_time: ${{ needs.discover.outputs.trigger_time }}
       git_sha: ${{ needs.discover.outputs.git_sha }}
       nr_overrides: ${{ inputs.nr_overrides }}
+      # Empty = default production collector. Set on the fork as a repository
+      # variable (Settings → Secrets and variables → Actions → Variables tab)
+      # so all runs on this fork route to the same account/environment.
+      collector_address: ${{ vars.NEW_RELIC_COLLECTOR_ADDRESS }}
     secrets: inherit
 
   # ─────────────────────────────────────────────────────────────────────────

@@ -128,12 +128,24 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     // writes SCENARIO_DONE:skipped and exits so the workflow doesn't hang.
     private void startScenario(String scenarioId) {
         int harvestCycleSecs = getIntent().getIntExtra("NR_HARVEST_CYCLE_SECS", 30);
-        NRVideoConfiguration cfg = new NRVideoConfiguration.Builder(BuildConfig.NR_APPLICATION_TOKEN)
+        String collectorAddress = getIntent().getStringExtra("NR_COLLECTOR_ADDRESS");
+
+        NRVideoConfiguration.Builder builder = new NRVideoConfiguration.Builder(BuildConfig.NR_APPLICATION_TOKEN)
                 .autoDetectPlatform(getApplicationContext())
                 .withHarvestCycle(harvestCycleSecs)
                 .enableLogging()
-                .enableQoeAggregate(BuildConfig.QOE_AGGREGATE_DEFAULT)
-                .build();
+                .enableQoeAggregate(BuildConfig.QOE_AGGREGATE_DEFAULT);
+
+        // A non-empty NR_COLLECTOR_ADDRESS points the /connect and /data
+        // endpoints at a non-prod NR ingest (typically the staging collector
+        // in CI runs). Leaving it unset preserves the SDK's built-in prod
+        // default rather than substituting an empty string, which the agent
+        // would try to route to.
+        if (collectorAddress != null && !collectorAddress.isEmpty()) {
+            builder.withCollectorAddress(collectorAddress);
+        }
+
+        NRVideoConfiguration cfg = builder.build();
         NRVideo.newBuilder(getApplicationContext()).withConfiguration(cfg).build();
 
         // Tag every event this process emits with the run metadata. Reading

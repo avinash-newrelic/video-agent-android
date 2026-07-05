@@ -60,6 +60,11 @@ on:
         required: false
         type: string
         default: ''
+      collector_address:
+        description: 'NRVA collector hostname. Empty = default prod collector.'
+        required: false
+        type: string
+        default: ''
     secrets:
       NEW_RELIC_APP_TOKEN:
         required: false
@@ -139,6 +144,7 @@ jobs:
           APK_PATH: ${{ steps.apk.outputs.path }}
           SCENARIOS_JSON: ${{ inputs.scenarios_json }}
           NR_OVERRIDES: ${{ inputs.nr_overrides }}
+          COLLECTOR_ADDRESS: ${{ inputs.collector_address }}
           LEG_TAG: ${{ inputs.leg_tag }}
           NRVA_VERSION: ${{ inputs.nrva_version }}
           RUN_ID: ${{ inputs.run_id }}
@@ -199,6 +205,15 @@ jobs:
               # Wipe last run's log if any (idempotent scenario start).
               adb shell rm -f "$LOG_ON_DEVICE" 2>/dev/null || true
 
+              # Collector override is a per-scenario intent extra rather than
+              # a build-time constant so the same APK can be pointed at
+              # staging vs prod without a rebuild. Empty value → the app
+              # falls through to the NRVA default (prod collector).
+              COLLECTOR_EXTRA=""
+              if [ -n "${COLLECTOR_ADDRESS:-}" ]; then
+                COLLECTOR_EXTRA="-e NR_COLLECTOR_ADDRESS \"$COLLECTOR_ADDRESS\""
+              fi
+
               # Force-stop the app so each scenario boots clean, then dispatch.
               adb shell am force-stop "$APP_PKG" || true
               adb shell am start -W -n "$APP_PKG/$APP_ACTIVITY" \
@@ -208,6 +223,7 @@ jobs:
                 -e RUN_ID "$RUN_ID" \
                 -e TRIGGER_TIME "$TRIGGER_TIME" \
                 -e GIT_SHA "$GIT_SHA" \
+                $COLLECTOR_EXTRA \
                 $EXTRAS > /dev/null
 
               # Poll for the DONE sentinel with a hard cap. Save whatever
