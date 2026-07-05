@@ -30,11 +30,21 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout upstream NRVA at tag
+      # Checks out this fork at the ref that triggered the master workflow.
+      # This gives us the scenario-mode sample-app code (SCENARIO_ID intent
+      # handling, per-scenario finish sentinels, NRVideo global attribute
+      # tagging) that upstream v<version> tags don't carry.
+      #
+      # The trade-off: NRVA modules built into the APK are the fork's HEAD
+      # versions, not the tag's. So the `nrva_version` matrix input is a
+      # label attached to telemetry rather than a real version-under-test —
+      # useful for run attribution but not (yet) for version-regression
+      # detection. Wiring published-artifact dependency substitution per
+      # matrix version is a follow-up: NRVideoConfiguration.Builder shape
+      # has changed across 4.x releases so a straight JitPack swap won't
+      # compile against the current sample app for older versions.
+      - name: Checkout this fork
         uses: actions/checkout@v4
-        with:
-          repository: newrelic/video-agent-android
-          ref: v${{ inputs.nrva_version }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
