@@ -42,6 +42,19 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         String scenarioId = getIntent().getStringExtra("SCENARIO_ID");
         Log.i("MainActivity", "onCreate scenarioId=" + scenarioId);
         if (scenarioId != null && !scenarioId.isEmpty()) {
+            // MainActivity.onCreate has been observed to fire twice in
+            // quick succession under the CI launch path (startActivity to a
+            // target player + finish() → Android sometimes recreates the
+            // finishing activity once before the transition completes).
+            // NRVideo is a process-wide singleton and its second .build()
+            // throws — but on the second invocation the target player
+            // activity is already on its way, so the right thing is to
+            // no-op and let the first entry's work finish.
+            if (NRVideo.isInitialized()) {
+                Log.i("MainActivity", "onCreate duplicate scenario entry, skipping");
+                finish();
+                return;
+            }
             startScenario(scenarioId);
             return;
         }
