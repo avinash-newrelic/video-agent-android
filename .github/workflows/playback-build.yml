@@ -74,13 +74,18 @@ jobs:
             gradle-${{ runner.os }}-${{ inputs.nrva_version }}-
             gradle-${{ runner.os }}-
 
-      - name: Assemble sample app (release, unsigned)
+      - name: Assemble sample app (debug)
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          # The release build type is unsigned; that's fine for emulator use.
-          # Debug would work too but is heavier because of instrumentation.
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          # `assembleDebug` is used instead of `assembleRelease` because a
+          # release APK from `assembleRelease` is unsigned by default —
+          # Android on API 24+ refuses to install with
+          # INSTALL_PARSE_FAILED_NO_CERTIFICATES. Debug builds are auto-
+          # signed with the Android SDK's debug keystore, so no signing
+          # config is needed in the workflow. Debug also carries more
+          # verbose Log.v output that helps when debugging a failing leg.
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
 
       - name: Locate APK
         id: apk

@@ -249,13 +249,18 @@ jobs:
               for tag in $(echo "$LEGS" | jq -r '.[].tag'); do
                 dir="artifacts/playback-${v}-${tag}"
                 if [ -d "$dir" ] && [ -f "$dir/SUMMARY.txt" ]; then
-                  ok=$(grep -c '^ok|' "$dir/SUMMARY.txt" || echo 0)
-                  tot=$(wc -l < "$dir/SUMMARY.txt" | tr -d ' ')
+                  # awk always emits a single number and exits 0, so the
+                  # arithmetic below can't be poisoned by a multi-line "0\n0"
+                  # (which is what `grep -c … || echo 0` produced when grep
+                  # matched nothing — grep exits 1, the || fires, and the
+                  # captured output is grep's "0" + echo's "0" on two lines).
+                  ok=$(awk -F'|' '$1=="ok" {n++} END {print n+0}' "$dir/SUMMARY.txt")
+                  tot=$(awk 'END {print NR+0}' "$dir/SUMMARY.txt")
                   total_ok=$((total_ok + ok))
                   total_expected=$((total_expected + tot))
-                  if   [ "$ok" -eq "$tot" ]; then icon="✅"
-                  elif [ "$ok" -gt 0 ];      then icon="⚠️"
-                  else                            icon="❌"
+                  if   [ "$ok" -eq "$tot" ] && [ "$tot" -gt 0 ]; then icon="✅"
+                  elif [ "$ok" -gt 0 ];                          then icon="⚠️"
+                  else                                                icon="❌"
                   fi
                   printf ' %s %s/%s |' "$icon" "$ok" "$tot"
                 else
