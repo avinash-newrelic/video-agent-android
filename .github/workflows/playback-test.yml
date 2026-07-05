@@ -174,13 +174,20 @@ jobs:
           done
 
           # ----- start logcat capture in background -----
-          adb logcat -c
+          # `adb logcat -c` fails intermittently on API 26 emulators with
+          # "failed to clear the 'main' log" — a known Android bug. `|| true`
+          # keeps the script alive under `set -eu` when it happens; a warm
+          # log buffer is a mild inconvenience, not a scenario failure.
+          adb logcat -c || true
           adb logcat -v time > "$OUT_DIR/logcat.log" &
           LOGCAT_PID=$!
           trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT
 
-          # ----- resolve app's external files dir -----
-          APP_EXT_DIR="/sdcard/Android/data/$APP_PKG/files"
+          # ----- log paths are in the app's internal storage -----
+          # /data/data/<pkg>/files/ — reachable only via `adb shell run-as`.
+          # We store the *relative* path (`files/logs/…`) because run-as
+          # cd's into /data/data/<pkg>/ before executing.
+          LOG_REL_DIR="files/logs"
 
           # ----- flatten NR overrides into `am start` extras -----
           # Extra-name convention matches iOS's ProcessInfo env-var reads
@@ -199,10 +206,10 @@ jobs:
           for SCENARIO in $(echo "$SCENARIOS_JSON" | jq -r '.[]'); do
             SCEN_DIR="$OUT_DIR/$SCENARIO"
             mkdir -p "$SCEN_DIR"
-            LOG_ON_DEVICE="$APP_EXT_DIR/logs/auto-play-$SCENARIO.log"
+            LOG_REL_FILE="$LOG_REL_DIR/auto-play-$SCENARIO.log"
 
             # Wipe last run's log if any (idempotent scenario start).
-            adb shell rm -f "$LOG_ON_DEVICE" 2>/dev/null || true
+            adb shell run-as "$APP_PKG" rm -f "$LOG_REL_FILE" 2>/dev/null || true
 
             # Collector override is a per-scenario intent extra rather than
             # a build-time constant so the same APK can be pointed at
@@ -229,11 +236,15 @@ jobs:
               $COLLECTOR_EXTRA \
               $EXTRAS
 
-            # Poll for the DONE sentinel with a hard cap.
+            # Poll for the DONE sentinel with a hard cap. `run-as` hops
+            # into the app's data dir; `grep -q` returns 0 on match, 1 on
+            # no-match or missing file. Combined with `2>/dev/null` and
+            # explicit `-eq 0`, the check is silent-on-fail and cleanly
+            # bounded by SCENARIO_TIMEOUT.
             STATUS="timeout"
             ELAPSED=0
             while [ $ELAPSED -lt $SCENARIO_TIMEOUT ]; do
-              if adb shell "test -f $LOG_ON_DEVICE && grep -q 'SCENARIO_DONE:' $LOG_ON_DEVICE" 2>/dev/null; then
+              if adb shell run-as "$APP_PKG" grep -q "SCENARIO_DONE:" "$LOG_REL_FILE" 2>/dev/null; then
                 STATUS="ok"
                 break
               fi
@@ -241,9 +252,11 @@ jobs:
               ELAPSED=$((ELAPSED + 3))
             done
 
-            # Pull artifacts. `adb pull` fails silently if the file is
-            # absent; that's fine — we already recorded the timeout.
-            adb pull "$LOG_ON_DEVICE" "$SCEN_DIR/auto-play-$SCENARIO.log" 2>/dev/null || true
+            # Pull artifacts via `run-as cat` rather than `adb pull`. Pull
+            # can't reach internal storage even for debuggable APKs — it
+            # only knows the /sdcard tree. `run-as cat` streams the file
+            # over stdout to the runner filesystem.
+            adb shell run-as "$APP_PKG" cat "$LOG_REL_FILE" > "$SCEN_DIR/auto-play-$SCENARIO.log" 2>/dev/null || true
             adb exec-out screencap -p > "$SCEN_DIR/screenshot.png" || true
 
             # Extract viewId from the log's first line, if present.

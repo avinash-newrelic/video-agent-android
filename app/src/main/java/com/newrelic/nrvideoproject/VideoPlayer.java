@@ -129,7 +129,11 @@ public class VideoPlayer extends AppCompatActivity {
 
     private void writeLogLine(String line) {
         try {
-            File dir = new File(getExternalFilesDir(null), "logs");
+            // See MainActivity.writeSentinel for why this is internal
+            // storage and not getExternalFilesDir — scoped storage on
+            // Android 11+ blocks `adb shell` from reading external app
+            // files, which breaks the CI workflow's SCENARIO_DONE poll.
+            File dir = new File(getFilesDir(), "logs");
             if (!dir.exists()) dir.mkdirs();
             try (FileWriter w = new FileWriter(new File(dir, "auto-play-" + scenarioId + ".log"), true)) {
                 w.write(line + "\n");

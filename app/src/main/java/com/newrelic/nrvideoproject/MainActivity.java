@@ -280,7 +280,13 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
 
     private void writeSentinel(String scenarioId, String reason) {
         try {
-            java.io.File dir = new java.io.File(getExternalFilesDir(null), "logs");
+            // Internal storage (/data/data/<pkg>/files/) rather than external
+            // (/sdcard/Android/data/<pkg>/files/). Scoped storage on Android
+            // 11+ hides the external app dir from `adb shell` running as
+            // the `shell` user, so the CI workflow can't `test -f` its way
+            // to the sentinel line. Internal storage is always reachable
+            // via `adb shell run-as <pkg> …` for debuggable APKs.
+            java.io.File dir = new java.io.File(getFilesDir(), "logs");
             if (!dir.exists()) dir.mkdirs();
             java.io.File f = new java.io.File(dir, "auto-play-" + scenarioId + ".log");
             try (java.io.FileWriter w = new java.io.FileWriter(f, true)) {
