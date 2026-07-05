@@ -1,0 +1,256 @@
+# Reusable child: runs one (nrva_version × leg) test job.
+#
+# Boots a KVM-accelerated AVD on an ubuntu-latest runner, installs the APK
+# produced by playback-build.yml, and dispatches each scenario in the caller's
+# list via `am start` intent extras. For each scenario, polls the app's log
+# file for a `SCENARIO_DONE` sentinel line and then tears down the activity
+# before starting the next one.
+#
+# Contract with the sample app:
+#   - Launching MainActivity with `-e SCENARIO_ID <id>` puts the app into
+#     auto-run mode: it picks the appropriate player activity, plays the
+#     scripted content, and terminates the scenario by writing a line matching
+#     `SCENARIO_DONE:<id>` to `/sdcard/Android/data/<pkg>/files/logs/auto-play-<id>.log`.
+#   - The app also reads NR_* extras (`-e NR_HARVEST_CYCLE_SECS 5` etc.) so
+#     nr_overrides passed from the master workflow can retune NRVA per run.
+#   - viewId for the scenario is written to that same log file on its first
+#     line, in the form `VIEW_ID:<uuid>`. This lets us surface it in the
+#     summary and link straight to the New Relic session.
+#
+# If those hooks aren't yet in the sample app, this workflow will still run —
+# every scenario will time out, `SUMMARY.txt` will show `timeout` rows, and
+# the run will exit 0 (see the "generator, not validator" note in README.md).
+
+name: playback-test
+
+on:
+  workflow_call:
+    inputs:
+      nrva_version:
+        required: true
+        type: string
+      leg_tag:
+        required: true
+        type: string
+      api_level:
+        required: true
+        type: number
+      target:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      profile:
+        required: true
+        type: string
+      scenarios_json:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+      trigger_time:
+        required: true
+        type: string
+      git_sha:
+        required: true
+        type: string
+      nr_overrides:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      NEW_RELIC_APP_TOKEN:
+        required: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_PKG: com.newrelic.nrvideoproject
+      APP_ACTIVITY: com.newrelic.nrvideoproject.MainActivity
+      SCENARIO_TIMEOUT: 120
+    steps:
+      # KVM must be user-accessible for hardware-accelerated emulator. Without
+      # this the emulator falls back to software rendering and a full playback
+      # scenario takes 10× longer than budget.
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: playback-app-${{ inputs.nrva_version }}
+          path: apk
+
+      - name: Locate APK path
+        id: apk
+        run: |
+          set -euo pipefail
+          APK=$(find apk -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK found in downloaded artifact"; exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      # AVD system images are large (~1-2 GB) and Google's CDN can throttle.
+      # Cache the SDK's system-images directory so subsequent runs on the same
+      # (api_level, target, arch) skip the download. Repo-wide cache cap is
+      # 10 GB with LRU eviction — four images fit comfortably.
+      - name: AVD system-image cache
+        id: avd-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ inputs.api_level }}-${{ inputs.target }}-${{ inputs.arch }}-${{ inputs.profile }}-v1
+
+      # A first pass without booting is the cheapest way to get the emulator
+      # action to prime the SDK components. On cache hit this is a no-op.
+      - name: Create AVD and generate snapshot on cache miss
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: ${{ inputs.target }}
+          arch: ${{ inputs.arch }}
+          profile: ${{ inputs.profile }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-boot-anim -no-audio -no-snapshot-save
+          disable-animations: true
+          script: echo "Snapshot primed"
+
+      - name: Run playback scenarios in emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          SCENARIOS_JSON: ${{ inputs.scenarios_json }}
+          NR_OVERRIDES: ${{ inputs.nr_overrides }}
+          LEG_TAG: ${{ inputs.leg_tag }}
+          NRVA_VERSION: ${{ inputs.nrva_version }}
+          RUN_ID: ${{ inputs.run_id }}
+          TRIGGER_TIME: ${{ inputs.trigger_time }}
+          GIT_SHA: ${{ inputs.git_sha }}
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: ${{ inputs.target }}
+          arch: ${{ inputs.arch }}
+          profile: ${{ inputs.profile }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-boot-anim -no-audio -no-snapshot-save
+          disable-animations: true
+          script: |
+            set -euo pipefail
+
+            OUT_DIR="playback-out"
+            mkdir -p "$OUT_DIR"
+            SUMMARY="$OUT_DIR/SUMMARY.txt"
+            : > "$SUMMARY"
+
+            # ----- install APK -----
+            adb wait-for-device
+            adb install -r -g "$APK_PATH"
+
+            # Grant common runtime permissions preemptively so a permission
+            # dialog can't stall a scenario.
+            for perm in POST_NOTIFICATIONS READ_MEDIA_VIDEO READ_EXTERNAL_STORAGE; do
+              adb shell pm grant "$APP_PKG" "android.permission.$perm" 2>/dev/null || true
+            done
+
+            # ----- start logcat capture in background -----
+            adb logcat -c
+            adb logcat -v time > "$OUT_DIR/logcat.log" &
+            LOGCAT_PID=$!
+            trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT
+
+            # ----- resolve app's external files dir -----
+            # This is where the sample app writes auto-play-<scenario>.log.
+            APP_EXT_DIR="/sdcard/Android/data/$APP_PKG/files"
+
+            # ----- flatten NR overrides into `am start` extras -----
+            EXTRAS=""
+            if [ -n "${NR_OVERRIDES// /}" ]; then
+              while IFS='=' read -r k v; do
+                # e.g. harvest_cycle_secs=5 → -e NR_HARVEST_CYCLE_SECS "5"
+                key_upper=$(echo "$k" | tr '[:lower:]' '[:upper:]')
+                EXTRAS+=" -e NR_${key_upper} \"$v\""
+              done < <(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+            fi
+
+            # ----- iterate scenarios -----
+            for SCENARIO in $(echo "$SCENARIOS_JSON" | jq -r '.[]'); do
+              SCEN_DIR="$OUT_DIR/$SCENARIO"
+              mkdir -p "$SCEN_DIR"
+              LOG_ON_DEVICE="$APP_EXT_DIR/logs/auto-play-$SCENARIO.log"
+
+              # Wipe last run's log if any (idempotent scenario start).
+              adb shell rm -f "$LOG_ON_DEVICE" 2>/dev/null || true
+
+              # Force-stop the app so each scenario boots clean, then dispatch.
+              adb shell am force-stop "$APP_PKG" || true
+              adb shell am start -W -n "$APP_PKG/$APP_ACTIVITY" \
+                -e SCENARIO_ID "$SCENARIO" \
+                -e LEG_TAG "$LEG_TAG" \
+                -e NRVA_VERSION "$NRVA_VERSION" \
+                -e RUN_ID "$RUN_ID" \
+                -e TRIGGER_TIME "$TRIGGER_TIME" \
+                -e GIT_SHA "$GIT_SHA" \
+                $EXTRAS > /dev/null
+
+              # Poll for the DONE sentinel with a hard cap. Save whatever
+              # log content we captured either way — a partial log is often
+              # enough to see where the app got stuck.
+              STATUS="timeout"
+              ELAPSED=0
+              while [ $ELAPSED -lt $SCENARIO_TIMEOUT ]; do
+                if adb shell "test -f $LOG_ON_DEVICE && grep -q 'SCENARIO_DONE:' $LOG_ON_DEVICE" 2>/dev/null; then
+                  STATUS="ok"
+                  break
+                fi
+                sleep 3
+                ELAPSED=$((ELAPSED + 3))
+              done
+
+              # Pull artifacts. `adb pull` fails silently if the file is
+              # absent; that's fine — we already recorded the timeout.
+              adb pull "$LOG_ON_DEVICE" "$SCEN_DIR/auto-play-$SCENARIO.log" 2>/dev/null || true
+              adb exec-out screencap -p > "$SCEN_DIR/screenshot.png" || true
+
+              # Extract viewId from the log's first line, if present.
+              VIEW_ID="(not-found)"
+              if [ -f "$SCEN_DIR/auto-play-$SCENARIO.log" ]; then
+                VIEW_ID=$(grep -m1 -oE 'VIEW_ID:[A-Za-z0-9-]+' "$SCEN_DIR/auto-play-$SCENARIO.log" \
+                  | head -1 | cut -d: -f2- || true)
+                VIEW_ID="${VIEW_ID:-(not-found)}"
+              fi
+
+              printf '%s|%s|%s|%s\n' "$STATUS" "$ELAPSED" "$SCENARIO" "$VIEW_ID" >> "$SUMMARY"
+            done
+
+            # ----- always exit 0 -----
+            # This workflow is a *generator*, not a validator. A timeout is
+            # not a workflow failure: the partial telemetry the app already
+            # sent to New Relic is still useful. Failing the job here would
+            # obscure that signal. See "generator, not validator" in README.md.
+
+      - name: Upload playback artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playback-${{ inputs.nrva_version }}-${{ inputs.leg_tag }}
+          path: playback-out/
+          retention-days: 14
+          if-no-files-found: warn

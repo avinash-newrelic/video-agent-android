@@ -1,0 +1,275 @@
+# Nightly NRVA-Android playback telemetry generator.
+#
+# Fans out (nrva_version × leg) test jobs on Ubuntu runners with KVM-accelerated
+# emulators, driving scripted playback scenarios in the sample app. Purpose is
+# generation of NRVA events into New Relic — not pass/fail testing. See
+# .github/workflows/README.md for the full picture.
+
+name: playback-master
+
+on:
+  schedule:
+    # 22:53 UTC — a few minutes after iOS so both accounts don't hit the New
+    # Relic collector at the same instant. Time is UTC on GitHub's clock.
+    - cron: '53 22 * * *'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Comma-separated NRVA versions (empty = auto-discover ≥ min_version)'
+        required: false
+        default: ''
+      legs:
+        description: 'Comma-separated leg tags (empty = all from playback-defaults.json)'
+        required: false
+        default: ''
+      scenarios:
+        description: 'Comma-separated scenario ids (empty = defaults from playback-defaults.json)'
+        required: false
+        default: ''
+      nr_overrides:
+        description: 'JSON of per-run NRVA config overrides (e.g. {"harvest_cycle_secs":5})'
+        required: false
+        default: ''
+      min_version:
+        description: 'Version floor for auto-discovery (only used when versions is empty)'
+        required: false
+        default: ''
+
+concurrency:
+  # A second scheduled trigger while the previous run is still executing would
+  # double our runner minute burn and produce interleaved telemetry that's hard
+  # to disambiguate downstream. Serialize on the workflow name.
+  group: playback-master
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # discover — resolve versions/legs/scenarios into concrete matrices that the
+  # build and test jobs will consume. Runs on Ubuntu because it's just JSON +
+  # a `gh release list` call; nothing needs macOS/Android tooling here.
+  # ─────────────────────────────────────────────────────────────────────────
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      legs: ${{ steps.plan.outputs.legs }}
+      scenarios: ${{ steps.plan.outputs.scenarios }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      test_matrix: ${{ steps.plan.outputs.test_matrix }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+      trigger_time: ${{ steps.plan.outputs.trigger_time }}
+      git_sha: ${{ steps.plan.outputs.git_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute matrices
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSIONS: ${{ inputs.versions }}
+          INPUT_LEGS: ${{ inputs.legs }}
+          INPUT_SCENARIOS: ${{ inputs.scenarios }}
+          INPUT_MIN_VERSION: ${{ inputs.min_version }}
+        run: |
+          set -euo pipefail
+
+          DEFAULTS='.github/workflows/playback-defaults.json'
+          MIN_VERSION="${INPUT_MIN_VERSION:-$(jq -r '.min_version' "$DEFAULTS")}"
+
+          # Versions: manual input wins; else discover from upstream NRVA releases.
+          # Auto-discovery targets the *upstream* repo (newrelic/video-agent-android)
+          # so we test the actual published artifacts, not whatever the fork carries.
+          if [ -n "${INPUT_VERSIONS// /}" ]; then
+            VERSIONS_JSON=$(echo "$INPUT_VERSIONS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -sc .)
+          else
+            VERSIONS_JSON=$(gh release list --repo newrelic/video-agent-android --limit 100 \
+              --json tagName,isDraft,isPrerelease \
+              --jq "[.[] | select(.isDraft==false and .isPrerelease==false) | .tagName | sub(\"^v\";\"\")]" \
+              | jq -c --arg min "$MIN_VERSION" '
+                  map(select(
+                    (split(".") | map(tonumber)) as $v |
+                    ($min | split(".") | map(tonumber)) as $m |
+                    ($v[0]  > $m[0]) or
+                    ($v[0] == $m[0] and $v[1]  > $m[1]) or
+                    ($v[0] == $m[0] and $v[1] == $m[1] and $v[2] >= $m[2])
+                  ))
+                ')
+          fi
+
+          # Legs: manual input wins; else use everything from defaults.
+          if [ -n "${INPUT_LEGS// /}" ]; then
+            LEGS_JSON=$(echo "$INPUT_LEGS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' \
+              | jq -R . | jq -sc --slurpfile all <(jq '.legs' "$DEFAULTS") '
+                  . as $picked | $all[0] | map(select(.tag as $t | $picked | index($t)))
+                ')
+          else
+            LEGS_JSON=$(jq -c '.legs' "$DEFAULTS")
+          fi
+
+          # Scenarios: manual input wins; else defaults.
+          if [ -n "${INPUT_SCENARIOS// /}" ]; then
+            SCENARIOS_JSON=$(echo "$INPUT_SCENARIOS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -sc .)
+          else
+            SCENARIOS_JSON=$(jq -c '.scenarios' "$DEFAULTS")
+          fi
+
+          # Build matrix is version-only. One APK is reused across every leg —
+          # unlike iOS, we don't need per-platform builds because the same APK
+          # runs on any Android API level ≥ the app's minSdk.
+          BUILD_MATRIX=$(echo "$VERSIONS_JSON" | jq -c '{ version: . }')
+
+          # Test matrix crosses versions × legs. Each entry carries the leg's
+          # full definition so the test workflow doesn't need to re-parse the
+          # defaults file.
+          TEST_MATRIX=$(jq -nc \
+            --argjson versions "$VERSIONS_JSON" \
+            --argjson legs "$LEGS_JSON" \
+            '{ include: [ $versions[] as $v | $legs[] as $l | { version: $v, leg: $l } ] }')
+
+          {
+            echo "versions=$VERSIONS_JSON"
+            echo "legs=$LEGS_JSON"
+            echo "scenarios=$SCENARIOS_JSON"
+            echo "build_matrix=$BUILD_MATRIX"
+            echo "test_matrix=$TEST_MATRIX"
+            echo "run_id=${{ github.run_number }}"
+            echo "trigger_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "git_sha=${{ github.sha }}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '### Resolved plan'
+            echo ''
+            echo '- **Versions:** '"$(echo "$VERSIONS_JSON" | jq -r 'join(", ")')"
+            echo '- **Legs:** '"$(echo "$LEGS_JSON" | jq -r '[.[].tag] | join(", ")')"
+            echo '- **Scenarios:** '"$(echo "$SCENARIOS_JSON" | jq -r 'join(", ")')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # build — one APK per NRVA version. The APK links against the versioned
+  # artifact pulled from JitPack (which mirrors GitHub release tags for this
+  # repo), so the resulting app really is running NRVA <version>.
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.build_matrix) }}
+    uses: ./.github/workflows/playback-build.yml
+    with:
+      nrva_version: ${{ matrix.version }}
+      run_id: ${{ needs.discover.outputs.run_id }}
+    secrets: inherit
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # test — one job per (version × leg). Boots an AVD, installs the matching
+  # APK, dispatches scenarios via `am start` extras, uploads artifacts.
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    needs: [discover, build]
+    strategy:
+      fail-fast: false
+      max-parallel: 20    # Ubuntu concurrency cap on free/Pro/Team is 20.
+      matrix: ${{ fromJson(needs.discover.outputs.test_matrix) }}
+    uses: ./.github/workflows/playback-test.yml
+    with:
+      nrva_version: ${{ matrix.version }}
+      leg_tag: ${{ matrix.leg.tag }}
+      api_level: ${{ matrix.leg.api_level }}
+      target: ${{ matrix.leg.target }}
+      arch: ${{ matrix.leg.arch }}
+      profile: ${{ matrix.leg.profile }}
+      scenarios_json: ${{ needs.discover.outputs.scenarios }}
+      run_id: ${{ needs.discover.outputs.run_id }}
+      trigger_time: ${{ needs.discover.outputs.trigger_time }}
+      git_sha: ${{ needs.discover.outputs.git_sha }}
+      nr_overrides: ${{ inputs.nr_overrides }}
+    secrets: inherit
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # summary — collate the artifact SUMMARY.txt files into a single Markdown
+  # grid on the run page. Always runs, even if some legs failed, because a
+  # failed leg is still informative — you want to see the shape of the
+  # damage rather than "the summary job was skipped."
+  # ─────────────────────────────────────────────────────────────────────────
+  summary:
+    needs: [discover, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all playback artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: playback-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Render summary
+        env:
+          RUN_ID: ${{ needs.discover.outputs.run_id }}
+          TRIGGER_TIME: ${{ needs.discover.outputs.trigger_time }}
+          VERSIONS: ${{ needs.discover.outputs.versions }}
+          LEGS: ${{ needs.discover.outputs.legs }}
+          SCENARIOS: ${{ needs.discover.outputs.scenarios }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Nightly playback run $RUN_ID"
+            echo ""
+            echo "- **Triggered:** $TRIGGER_TIME"
+            echo "- **Commit:** \`${{ github.sha }}\`"
+            echo ""
+            echo "## Coverage grid (scenarios ok / total)"
+            echo ""
+
+            printf '| version |'
+            echo "$LEGS" | jq -r '.[] | " " + .tag + " |"' | tr -d '\n'
+            echo ""
+            printf '|---|'
+            echo "$LEGS" | jq -r '.[] | "---|"' | tr -d '\n'
+            echo ""
+
+            total_ok=0
+            total_expected=0
+            missing=0
+
+            for v in $(echo "$VERSIONS" | jq -r '.[]'); do
+              printf '| %s |' "$v"
+              for tag in $(echo "$LEGS" | jq -r '.[].tag'); do
+                dir="artifacts/playback-${v}-${tag}"
+                if [ -d "$dir" ] && [ -f "$dir/SUMMARY.txt" ]; then
+                  ok=$(grep -c '^ok|' "$dir/SUMMARY.txt" || echo 0)
+                  tot=$(wc -l < "$dir/SUMMARY.txt" | tr -d ' ')
+                  total_ok=$((total_ok + ok))
+                  total_expected=$((total_expected + tot))
+                  if   [ "$ok" -eq "$tot" ]; then icon="✅"
+                  elif [ "$ok" -gt 0 ];      then icon="⚠️"
+                  else                            icon="❌"
+                  fi
+                  printf ' %s %s/%s |' "$icon" "$ok" "$tot"
+                else
+                  missing=$((missing + 1))
+                  printf ' ❔ missing |'
+                fi
+              done
+              echo ""
+            done
+
+            echo ""
+            legs_with_data=$(( total_expected > 0 ? 1 : 0 ))
+            echo "**Aggregate:** ${total_ok} / ${total_expected} scenarios succeeded across the matrix. ${missing} (version × leg) cells produced no artifact."
+
+            echo ""
+            echo "## Sample NRQL"
+            echo ""
+            echo '```sql'
+            echo "SELECT count(*) FROM Mobile_Video WHERE runId = '${RUN_ID}' FACET nrvaVersion, legTag, eventName SINCE 1 day ago"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

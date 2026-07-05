@@ -1,0 +1,59 @@
+{
+  "_comment": "Single source of truth for the nightly playback telemetry matrix. Edit here, nowhere else. Consumed by playback-master.yml discover job.",
+
+  "min_version": "4.1.0",
+
+  "legs": [
+    {
+      "tag": "android-15-api-35-pixel-8",
+      "api_level": 35,
+      "target": "google_apis",
+      "arch": "x86_64",
+      "profile": "pixel_8",
+      "runtime_origin": "downloaded"
+    },
+    {
+      "tag": "android-14-api-34-pixel-7",
+      "api_level": 34,
+      "target": "google_apis",
+      "arch": "x86_64",
+      "profile": "pixel_7",
+      "runtime_origin": "downloaded"
+    },
+    {
+      "tag": "android-11-api-30-pixel-4",
+      "api_level": 30,
+      "target": "google_apis",
+      "arch": "x86_64",
+      "profile": "pixel_4",
+      "runtime_origin": "downloaded"
+    },
+    {
+      "tag": "android-8-api-26-pixel-2",
+      "api_level": 26,
+      "target": "google_apis",
+      "arch": "x86_64",
+      "profile": "pixel_2",
+      "runtime_origin": "downloaded"
+    }
+  ],
+
+  "scenarios": [
+    "content-hls-lifecycle",
+    "content-mp4-lifecycle",
+    "content-error",
+    "ad-vmap-lifecycle",
+    "ad-error",
+    "ssai-mediatailor-lifecycle"
+  ],
+
+  "scenario_timeout_seconds": 120,
+
+  "runner": "ubuntu-latest",
+
+  "_notes": {
+    "leg_naming": "android-<marketing-version>-api-<level>-<device-profile>. Follow the least-model rule when picking a device profile in a generation (Pixel base, not Pro/Fold).",
+    "runtime_origin": "'preinstalled' would mean the AVD system image ships on the runner. In practice all google_apis images are downloaded at job time on ubuntu-latest; keeping the key parallel to iOS for readability.",
+    "ssai_leg": "ssai-mediatailor-lifecycle is Android-only (iOS does not currently ship a MediaTailor tracker). Drop from the scenario list to reach parity with iOS's five-scenario default."
+  }
+}

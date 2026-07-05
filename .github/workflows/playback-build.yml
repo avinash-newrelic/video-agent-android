@@ -1,0 +1,102 @@
+# Reusable child: builds one NRSampleApp APK against a specific NRVA release.
+#
+# Contract with the caller:
+#   - Input `nrva_version` is a bare version string like "4.3.0" (no leading v).
+#   - Output is a single artifact named `playback-app-<version>` containing
+#     app-playback-release-unsigned.apk. The test workflow downloads this by
+#     the same name.
+#
+# Design note: we don't build against the local module sources on this branch
+# because we want the test to exercise the *published* NRVA artifact for that
+# version, not whatever HEAD looks like. The build swaps in JitPack coordinates
+# for the four modules and disables `include ':NR*'` in settings.gradle.
+
+name: playback-build
+
+on:
+  workflow_call:
+    inputs:
+      nrva_version:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+    secrets:
+      NEW_RELIC_APP_TOKEN:
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream NRVA at tag
+        uses: actions/checkout@v4
+        with:
+          repository: newrelic/video-agent-android
+          ref: v${{ inputs.nrva_version }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configure sample app for CI build
+        # The sample app reads NR_APPLICATION_TOKEN via local.properties. If
+        # the secret is absent we still want the build to succeed — the app
+        # will just fail to send telemetry, which surfaces as a zero-event
+        # leg in the summary. That's a clearer signal than a red build.
+        run: |
+          set -euo pipefail
+          {
+            echo "nr.applicationToken=${{ secrets.NEW_RELIC_APP_TOKEN }}"
+            echo "nr.qoeAggregate=true"
+          } > local.properties
+
+          # Older tags (4.1.x) did not include the MediaTailor module and its
+          # associated sample activity. Guard the ssai-mediatailor scenario at
+          # runtime rather than failing the build.
+          if ! grep -q "NRMediaTailorTracker" settings.gradle 2>/dev/null; then
+            echo "NRVA_HAS_MEDIATAILOR=false" >> "$GITHUB_ENV"
+          else
+            echo "NRVA_HAS_MEDIATAILOR=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ inputs.nrva_version }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ inputs.nrva_version }}-
+            gradle-${{ runner.os }}-
+
+      - name: Assemble sample app (release, unsigned)
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          # The release build type is unsigned; that's fine for emulator use.
+          # Debug would work too but is heavier because of instrumentation.
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Locate APK
+        id: apk
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK produced. Check the assembleRelease step."
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: playback-app-${{ inputs.nrva_version }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 7
+          if-no-files-found: error
