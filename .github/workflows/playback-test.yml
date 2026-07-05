@@ -158,8 +158,14 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -no-boot-anim -no-audio -no-snapshot-save
           disable-animations: true
+          # reactivecircus/android-emulator-runner executes `script:` via
+          # /bin/sh, which on ubuntu-latest is dash. Dash rejects `set -o
+          # pipefail`, the `${var// /}` parameter-expansion pattern, `+=`
+          # string concatenation, and `< <(...)` process substitution — so
+          # this block stays POSIX. We `set -eu` (no pipefail) and
+          # substitute `while ... | pipe` for process substitution.
           script: |
-            set -euo pipefail
+            set -eu
 
             OUT_DIR="playback-out"
             mkdir -p "$OUT_DIR"
@@ -194,12 +200,15 @@ jobs:
             # app reads NEW_RELIC_* — it's a namespace shared with the
             # native NR SDK's env-based config.
             EXTRAS=""
-            if [ -n "${NR_OVERRIDES// /}" ]; then
-              while IFS='=' read -r k v; do
-                # e.g. harvest_cycle_secs=5 → -e NEW_RELIC_HARVEST_CYCLE_SECS "5"
+            NR_OVERRIDES_TRIMMED=$(echo "${NR_OVERRIDES:-}" | tr -d ' ')
+            if [ -n "$NR_OVERRIDES_TRIMMED" ] && [ "$NR_OVERRIDES_TRIMMED" != "{}" ]; then
+              # Piped `while` runs in a subshell in POSIX sh — that's why the
+              # accumulated EXTRAS string is captured via command substitution
+              # of the loop output rather than assignment inside the loop.
+              EXTRAS=$(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while IFS='=' read -r k v; do
                 key_upper=$(echo "$k" | tr '[:lower:]' '[:upper:]')
-                EXTRAS+=" -e NEW_RELIC_${key_upper} \"$v\""
-              done < <(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+                printf ' -e NEW_RELIC_%s "%s"' "$key_upper" "$v"
+              done)
             fi
 
             # ----- iterate scenarios -----
