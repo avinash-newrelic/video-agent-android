@@ -3,6 +3,7 @@ package com.newrelic.nrvideoproject;
 import androidx.appcompat.app.AppCompatActivity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.View;
 import android.widget.Switch;
 
@@ -24,6 +25,14 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Log every extra the intent carries at launch time so a CI leg that
+        // silently falls through to the UI branch can be diagnosed from the
+        // artifact logcat alone. This is the only place where a
+        // scenario-mode-vs-interactive-mode misroute is observable without
+        // a debugger, so the cost of one log line per launch is worth it.
+        Bundle extras = getIntent().getExtras();
+        Log.i("MainActivity", "onCreate extras=" + (extras == null ? "null" : extras.toString()));
+
         // CI auto-run: the playback-telemetry workflow launches MainActivity
         // with `-e SCENARIO_ID <id>` extras. In that mode we skip the UI,
         // apply per-run NRVA overrides, tag every future event with the run
@@ -31,6 +40,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         // A missing SCENARIO_ID means a normal interactive launch and we fall
         // through to the existing button-driven flow.
         String scenarioId = getIntent().getStringExtra("SCENARIO_ID");
+        Log.i("MainActivity", "onCreate scenarioId=" + scenarioId);
         if (scenarioId != null && !scenarioId.isEmpty()) {
             startScenario(scenarioId);
             return;
@@ -134,6 +144,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     // an extra (from a workflow secret). If it's absent the target activity
     // writes SCENARIO_DONE:skipped and exits so the workflow doesn't hang.
     private void startScenario(String scenarioId) {
+        Log.i("MainActivity", "startScenario id=" + scenarioId);
         int harvestCycleSecs      = intExtra("NEW_RELIC_HARVEST_CYCLE_SECS", 10);
         int liveHarvestCycleSecs  = intExtra("NEW_RELIC_LIVE_HARVEST_CYCLE_SECS", 10);
         int regularBatchBytes     = intExtra("NEW_RELIC_REGULAR_BATCH_SIZE_BYTES", 65536);

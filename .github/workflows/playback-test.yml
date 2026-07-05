@@ -206,6 +206,10 @@ jobs:
             fi
 
             # Force-stop the app so each scenario boots clean, then dispatch.
+            # `am start` output is kept in stdout (not redirected) so the
+            # workflow log preserves the "Starting: Intent { ... (has extras) }"
+            # line — invaluable when a leg goes zero-events and we need to
+            # verify that am actually received the extras we tried to pass.
             adb shell am force-stop "$APP_PKG" || true
             adb shell am start -W -n "$APP_PKG/$APP_ACTIVITY" \
               -e SCENARIO_ID "$SCENARIO" \
@@ -215,7 +219,7 @@ jobs:
               -e TRIGGER_TIME "$TRIGGER_TIME" \
               -e GIT_SHA "$GIT_SHA" \
               $COLLECTOR_EXTRA \
-              $EXTRAS > /dev/null
+              $EXTRAS
 
             # Poll for the DONE sentinel with a hard cap.
             STATUS="timeout"
