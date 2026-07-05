@@ -187,12 +187,18 @@ jobs:
             APP_EXT_DIR="/sdcard/Android/data/$APP_PKG/files"
 
             # ----- flatten NR overrides into `am start` extras -----
+            # Extra-name convention matches iOS's ProcessInfo env-var reads
+            # exactly (NEW_RELIC_HARVEST_CYCLE_SECS etc.), so the same
+            # nr_overrides JSON forwarded from playback-master applies
+            # symmetrically to both platforms. Nothing else in the sample
+            # app reads NEW_RELIC_* — it's a namespace shared with the
+            # native NR SDK's env-based config.
             EXTRAS=""
             if [ -n "${NR_OVERRIDES// /}" ]; then
               while IFS='=' read -r k v; do
-                # e.g. harvest_cycle_secs=5 → -e NR_HARVEST_CYCLE_SECS "5"
+                # e.g. harvest_cycle_secs=5 → -e NEW_RELIC_HARVEST_CYCLE_SECS "5"
                 key_upper=$(echo "$k" | tr '[:lower:]' '[:upper:]')
-                EXTRAS+=" -e NR_${key_upper} \"$v\""
+                EXTRAS+=" -e NEW_RELIC_${key_upper} \"$v\""
               done < <(echo "$NR_OVERRIDES" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
             fi
 
@@ -211,7 +217,7 @@ jobs:
               # falls through to the NRVA default (prod collector).
               COLLECTOR_EXTRA=""
               if [ -n "${COLLECTOR_ADDRESS:-}" ]; then
-                COLLECTOR_EXTRA="-e NR_COLLECTOR_ADDRESS \"$COLLECTOR_ADDRESS\""
+                COLLECTOR_EXTRA="-e NEW_RELIC_COLLECTOR_ADDRESS \"$COLLECTOR_ADDRESS\""
               fi
 
               # Force-stop the app so each scenario boots clean, then dispatch.

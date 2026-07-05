@@ -112,12 +112,19 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     // ── CI scenario dispatch ─────────────────────────────────────────────────
     //
     // Each `scenarioId` maps to (target activity, playback URL, optional ad
-    // tag URL). We build NRVideo with any NR_* overrides passed as intent
-    // extras (currently only harvest cycle is exposed), set the run/leg/
-    // scenario metadata as global attributes so every event NRVA emits during
-    // this process is tagged, and hand off to the player activity.
+    // tag URL). We build NRVideo with any NEW_RELIC_* overrides passed as
+    // intent extras (extra names match the iOS ProcessInfo env-var
+    // convention exactly, so the workflow can forward the same nr_overrides
+    // JSON to both platforms), set the run/leg/scenario metadata as global
+    // attributes so every event NRVA emits during this process is tagged,
+    // and hand off to the player activity.
     //
-    // The URLs here have to keep working from a CI runner with no external
+    // Defaults here mirror the iOS sample (harvest=10s, QoE on, debug on,
+    // aggressive batch sizes) — a telemetry generator wants shorter cycles
+    // and more events than the SDK's ship defaults, otherwise a two-minute
+    // scenario might harvest only once.
+    //
+    // The URLs have to keep working from a CI runner with no external
     // secrets — public sample streams, and the Google-hosted VMAP tag the
     // interactive flow already uses. A deliberately-invalid URL powers the
     // content-error scenario; a syntactically-valid-but-nonexistent VMAP
@@ -127,26 +134,55 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     // an extra (from a workflow secret). If it's absent the target activity
     // writes SCENARIO_DONE:skipped and exits so the workflow doesn't hang.
     private void startScenario(String scenarioId) {
-        int harvestCycleSecs = getIntent().getIntExtra("NR_HARVEST_CYCLE_SECS", 30);
-        String collectorAddress = getIntent().getStringExtra("NR_COLLECTOR_ADDRESS");
+        int harvestCycleSecs      = intExtra("NEW_RELIC_HARVEST_CYCLE_SECS", 10);
+        int liveHarvestCycleSecs  = intExtra("NEW_RELIC_LIVE_HARVEST_CYCLE_SECS", 10);
+        int regularBatchBytes     = intExtra("NEW_RELIC_REGULAR_BATCH_SIZE_BYTES", 65536);
+        int liveBatchBytes        = intExtra("NEW_RELIC_LIVE_BATCH_SIZE_BYTES", 32768);
+        int maxDeadLetterSize     = intExtra("NEW_RELIC_MAX_DEAD_LETTER_SIZE", 100);
+        boolean memoryOptimization = boolExtra("NEW_RELIC_MEMORY_OPTIMIZATION", false);
+        boolean debugLogging      = boolExtra("NEW_RELIC_DEBUG_LOGGING", true);
+        boolean qoeEnabled        = boolExtra("NEW_RELIC_QOE_ENABLED", true);
+        int qoeMultiplier         = intExtra("NEW_RELIC_QOE_INTERVAL_MULTIPLIER", 2);
+        String collectorAddress   = getIntent().getStringExtra("NEW_RELIC_COLLECTOR_ADDRESS");
 
         NRVideoConfiguration.Builder builder = new NRVideoConfiguration.Builder(BuildConfig.NR_APPLICATION_TOKEN)
                 .autoDetectPlatform(getApplicationContext())
                 .withHarvestCycle(harvestCycleSecs)
-                .enableLogging()
-                .enableQoeAggregate(BuildConfig.QOE_AGGREGATE_DEFAULT);
+                .withLiveHarvestCycle(liveHarvestCycleSecs)
+                .withRegularBatchSize(regularBatchBytes)
+                .withLiveBatchSize(liveBatchBytes)
+                .withMaxDeadLetterSize(maxDeadLetterSize)
+                .withMemoryOptimization(memoryOptimization)
+                .enableQoeAggregate(qoeEnabled)
+                .withQoeAggregateIntervalMultiplier(qoeMultiplier);
 
-        // A non-empty NR_COLLECTOR_ADDRESS points the /connect and /data
-        // endpoints at a non-prod NR ingest (typically the staging collector
-        // in CI runs). Leaving it unset preserves the SDK's built-in prod
-        // default rather than substituting an empty string, which the agent
-        // would try to route to.
+        // enableLogging() has no boolean overload — calling it turns logs on
+        // and there's no way to turn them off afterwards short of not calling
+        // it. So the debug flag gates the call itself.
+        if (debugLogging) builder.enableLogging();
+
+        // A non-empty NEW_RELIC_COLLECTOR_ADDRESS points the /connect and
+        // /data endpoints at a non-prod NR ingest (typically the staging
+        // collector in CI runs). Leaving it unset preserves the SDK's
+        // built-in prod default rather than substituting an empty string,
+        // which the agent would try to route to.
         if (collectorAddress != null && !collectorAddress.isEmpty()) {
             builder.withCollectorAddress(collectorAddress);
         }
 
         NRVideoConfiguration cfg = builder.build();
         NRVideo.newBuilder(getApplicationContext()).withConfiguration(cfg).build();
+
+        // App version and environment are useful facet dimensions when NR
+        // hosts multiple teams' workflow output in one account — you can
+        // filter to just this sample-app's events without knowing every
+        // attribution attribute. `environment` follows the iOS convention:
+        // the presence of a custom collector implies staging, absence
+        // implies production.
+        String appVersion = getAppVersion();
+        if (appVersion != null) NRVideo.setGlobalAttribute("appVersion", appVersion);
+        NRVideo.setGlobalAttribute("environment",
+                (collectorAddress != null && !collectorAddress.isEmpty()) ? "staging" : "production");
 
         // Tag every event this process emits with the run metadata. Reading
         // any of these attributes back via NRQL is how the workflow finds
@@ -158,6 +194,14 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             String v = getIntent().getStringExtra(extraNames[i]);
             NRVideo.setGlobalAttribute(metaKeys[i], v != null ? v : "(unset)");
         }
+
+        // A stable per-leg user id — the same leg on repeated nightly runs
+        // maps to the same synthetic user, so retention/engagement panels
+        // in the NR UI don't view every scenario as a brand-new visitor.
+        // We can't use a device identifier here (Android privacy rules
+        // guard those) so `legTag` doubles as a synthetic user.
+        String legTag = getIntent().getStringExtra("LEG_TAG");
+        NRVideo.setUserId(legTag != null && !legTag.isEmpty() ? legTag : "ci-user-unknown");
 
         String contentMp4 = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
         String contentHls = "https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/bipbop_16x9_variant.m3u8";
@@ -219,5 +263,34 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 w.write("SCENARIO_DONE:" + scenarioId + " reason=" + reason + "\n");
             }
         } catch (java.io.IOException ignore) { }
+    }
+
+    // Intent extras arrive as strings from `am start -e` regardless of the
+    // caller's intended type. Parsing here matches the iOS ProcessInfo
+    // helpers: missing → default, malformed → default. Callers get a clean
+    // int/bool without every one of them repeating try/catch scaffolding.
+
+    private int intExtra(String key, int fallback) {
+        String v = getIntent().getStringExtra(key);
+        if (v == null || v.isEmpty()) return fallback;
+        try { return Integer.parseInt(v.trim()); }
+        catch (NumberFormatException e) { return fallback; }
+    }
+
+    private boolean boolExtra(String key, boolean fallback) {
+        String v = getIntent().getStringExtra(key);
+        if (v == null || v.isEmpty()) return fallback;
+        v = v.trim().toLowerCase();
+        if (v.equals("true") || v.equals("1") || v.equals("yes")) return true;
+        if (v.equals("false") || v.equals("0") || v.equals("no")) return false;
+        return fallback;
+    }
+
+    private String getAppVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return null;
+        }
     }
 }
