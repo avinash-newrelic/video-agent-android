@@ -14,10 +14,15 @@ import androidx.media3.ui.PlayerView;
 import com.newrelic.videoagent.core.NRAdConfig;
 import com.newrelic.videoagent.core.NRVideo;
 import com.newrelic.videoagent.core.NRVideoPlayerConfiguration;
+import com.newrelic.videoagent.core.NewRelicVideoAgent;
+import com.newrelic.videoagent.core.tracker.NRTracker;
+import com.newrelic.videoagent.core.tracker.NRVideoTracker;
 
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -85,6 +90,12 @@ public class VideoPlayerMediaTailor extends AppCompatActivity {
     private ExoPlayer player;
     private Integer trackerId;
 
+    // Scenario-mode state. Populated only when this activity was launched
+    // through the CI dispatch path in MainActivity.
+    private String scenarioId;
+    private final Handler scenarioHandler = new Handler(Looper.getMainLooper());
+    private boolean scenarioFinished = false;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -94,6 +105,8 @@ public class VideoPlayerMediaTailor extends AppCompatActivity {
         // quick-tunnel or a local proxy with a user-installed root CA), rely
         // on res/xml/network_security_config.xml's <debug-overrides>, which
         // trusts user CAs only in debug builds. Do not bypass SSL in code.
+
+        scenarioId = getIntent().getStringExtra("scenario");
 
         String protocol = getIntent().getStringExtra("protocol");
         if (protocol == null || protocol.isEmpty()) protocol = DEFAULT_PROTOCOL;
@@ -107,6 +120,23 @@ public class VideoPlayerMediaTailor extends AppCompatActivity {
             sessionInitUrl = MT_HLS_SESSION_INIT_PREFIX + MT_HLS_MANIFEST_PATH;
         } else {
             sessionInitUrl = MT_DASH_SESSION_INIT_PREFIX + MT_DASH_MANIFEST_PATH;
+        }
+
+        // In scenario mode we require an explicit sessionInitUrl passed via
+        // extras — the compile-time placeholders (<HASH>, <REGION>) can't
+        // resolve to a real MediaTailor session and would hang the workflow.
+        // Marking the scenario "skipped" via the sentinel is the right
+        // outcome: the workflow's poll completes, the run summary shows
+        // the missing coverage, and the operator can wire the URL when
+        // ready without breaking other legs.
+        if (scenarioId != null && (overrideInit == null || overrideInit.isEmpty())) {
+            writeSentinel("skipped-no-session-init-url");
+            finishAndRemoveTask();
+            return;
+        }
+        if (scenarioId != null) {
+            int durationMs = getIntent().getIntExtra("scenarioDurationMs", 45000);
+            scenarioHandler.postDelayed(() -> finishScenario("timeout"), durationMs);
         }
 
         Log.v(TAG, "Protocol=" + protocol + " Session init URL: " + sessionInitUrl);
@@ -155,6 +185,16 @@ public class VideoPlayerMediaTailor extends AppCompatActivity {
 
         trackerId = NRVideo.addPlayer(cfg);
         Log.d(TAG, "MediaTailor tracker registered, id=" + trackerId);
+
+        if (scenarioId != null) {
+            writeLogLine("VIEW_ID:" + getViewIdOrPlaceholder());
+            player.addListener(new androidx.media3.common.Player.Listener() {
+                @Override
+                public void onPlayerError(androidx.media3.common.PlaybackException e) {
+                    finishScenario("player-error:" + e.getErrorCodeName());
+                }
+            });
+        }
 
         // The tracker auto-derives the tracking URL from the sessionized
         // manifest URL passed to ExoPlayer below — no setTrackingUrl() call
@@ -237,6 +277,42 @@ public class VideoPlayerMediaTailor extends AppCompatActivity {
             throw new IOException("Session init JSON parse failed", je);
         } finally {
             conn.disconnect();
+        }
+    }
+
+    // ── CI scenario-mode helpers ─────────────────────────────────────────────
+
+    private String getViewIdOrPlaceholder() {
+        try {
+            NRTracker t = NewRelicVideoAgent.getInstance().getContentTracker(trackerId);
+            if (t instanceof NRVideoTracker) return ((NRVideoTracker) t).getViewId();
+        } catch (Exception ignore) { }
+        return "(unavailable)";
+    }
+
+    private synchronized void finishScenario(String reason) {
+        if (scenarioFinished) return;
+        scenarioFinished = true;
+        scenarioHandler.removeCallbacksAndMessages(null);
+        writeLogLine("SCENARIO_DONE:" + scenarioId + " reason=" + reason);
+        finishAndRemoveTask();
+    }
+
+    private void writeSentinel(String reason) {
+        if (scenarioFinished) return;
+        scenarioFinished = true;
+        writeLogLine("SCENARIO_DONE:" + scenarioId + " reason=" + reason);
+    }
+
+    private void writeLogLine(String line) {
+        try {
+            File dir = new File(getExternalFilesDir(null), "logs");
+            if (!dir.exists()) dir.mkdirs();
+            try (FileWriter w = new FileWriter(new File(dir, "auto-play-" + scenarioId + ".log"), true)) {
+                w.write(line + "\n");
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "scenario log write failed", e);
         }
     }
 }
