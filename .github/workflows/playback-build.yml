@@ -69,34 +69,63 @@ jobs:
             echo "NRVA_HAS_MEDIATAILOR=true" >> "$GITHUB_ENV"
           fi
 
-      # Swap the four local NRVA module sources for the *published* JitPack
-      # artifacts of the matrix version, so the APK really runs NRVA
-      # <nrva_version> (not fork HEAD). The sample-app source stays the fork's
-      # (scenario-mode instrumentation); only the linked library changes.
-      # Safe for the 4.3.x window this rig targets — the Builder API is stable
-      # across those patches. If the matrix ever floors below where the current
-      # sample app compiles, this step is where a per-version source shim goes.
+      # Swap the local NRVA module sources for the *published* JitPack artifacts
+      # of the matrix version, so the APK really runs NRVA <nrva_version> (not
+      # fork HEAD). The sample-app source stays the fork's (scenario-mode
+      # instrumentation); only the linked library changes.
+      #
+      # MediaTailor was first published as a JitPack artifact at v4.3.1. For
+      # older versions there is no NRMediaTailorTracker:<v> to resolve, so we
+      # build against the three modules that exist and strip the MediaTailor
+      # sample activity (and its ssai scenario) so the app still compiles. The
+      # ssai leg then reports skipped rather than failing the build.
       - name: Use published NRVA artifacts for ${{ inputs.nrva_version }}
         run: |
           set -euo pipefail
           V="v${{ inputs.nrva_version }}"
           GRP="com.github.newrelic.video-agent-android"
+          APP=app/src/main/java/com/newrelic/nrvideoproject
+          MAIN="$APP/MainActivity.java"
+          MANIFEST=app/src/main/AndroidManifest.xml
 
-          for M in NewRelicVideoCore NRExoPlayerTracker NRIMATracker NRMediaTailorTracker; do
+          # HAS_MT = (nrva_version >= 4.3.1). sort -V puts the lower version
+          # first; if that's 4.3.1 then the matrix version is >= 4.3.1.
+          if [ "$(printf '%s\n' 4.3.1 "${{ inputs.nrva_version }}" | sort -V | head -1)" = "4.3.1" ]; then
+            HAS_MT=true
+          else
+            HAS_MT=false
+          fi
+
+          MODULES="NewRelicVideoCore NRExoPlayerTracker NRIMATracker"
+          [ "$HAS_MT" = true ] && MODULES="$MODULES NRMediaTailorTracker"
+
+          for M in $MODULES; do
             sed -i "s#implementation project(path: ':${M}')#implementation '${GRP}:${M}:${V}'#" app/build.gradle
             sed -i "/include ':${M}'/d" settings.gradle
           done
 
-          # The published artifacts live on JitPack, but only `buildscript`
-          # lists it — `allprojects.repositories` (where app deps resolve) has
-          # just google()+mavenCentral(). Add jitpack after every mavenCentral
-          # so the swapped coordinates resolve. Duplicate in buildscript is a
-          # harmless no-op.
+          if [ "$HAS_MT" != true ]; then
+            # No published MediaTailor for this version: drop the dep, the
+            # module include, the sample activity, and its references so the
+            # app compiles. The ssai scenario writes a skip sentinel instead of
+            # launching a class that no longer exists.
+            sed -i "/implementation project(path: ':NRMediaTailorTracker')/d" app/build.gradle
+            sed -i "/include ':NRMediaTailorTracker'/d" settings.gradle
+            rm -f "$APP/VideoPlayerMediaTailor.java"
+            sed -i 's/return VideoPlayerMediaTailor\.class;/return VideoPlayer.class;/' "$MAIN"
+            sed -i 's/target = VideoPlayerMediaTailor\.class; url = "";.*break;/writeSentinel(scenarioId, "skipped-no-mediatailor-in-version"); finishAndRemoveTask(); return;/' "$MAIN"
+            perl -0pi -e 's/\s*<activity\s+android:name="\.VideoPlayerMediaTailor".*?\/>//s' "$MANIFEST"
+          fi
+
+          # Published artifacts live on JitPack, but only `buildscript` lists it
+          # — `allprojects.repositories` (where app deps resolve) has just
+          # google()+mavenCentral(). Add jitpack after every mavenCentral so the
+          # swapped coordinates resolve. Duplicate in buildscript is a no-op.
           sed -i "s#mavenCentral()#mavenCentral()\n        maven { url 'https://jitpack.io' }#g" build.gradle
 
+          echo "--- HAS_MT=$HAS_MT  version=${{ inputs.nrva_version }} ---"
           echo "--- app/build.gradle NRVA deps ---"; grep "$GRP" app/build.gradle
           echo "--- settings.gradle ---"; cat settings.gradle
-          echo "--- repositories ---"; grep -n "jitpack" build.gradle
 
       - name: Gradle cache
         uses: actions/cache@v4
