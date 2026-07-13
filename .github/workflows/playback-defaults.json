@@ -1,7 +1,7 @@
 {
   "_comment": "Single source of truth for the nightly playback telemetry matrix. Edit here, nowhere else. Consumed by playback-master.yml discover job.",
 
-  "min_version": "4.3.0",
+  "min_version": "4.3.1",
 
   "legs": [
     {
@@ -48,6 +48,7 @@
     "runtime_origin": "'preinstalled' would mean the AVD system image ships on the runner. In practice all google_apis images are downloaded at job time on ubuntu-latest; keeping the key parallel to iOS for readability.",
     "ssai_leg": "ssai-mediatailor-lifecycle is Android-only (iOS does not currently ship a MediaTailor tracker). Drop from the scenario list to reach parity with iOS's five-scenario default.",
     "device_profiles": "Must be present in `avdmanager list device` on the runner's SDK. As of ubuntu-latest in 2026-07 pixel_8 / pixel_7 are NOT in that list — pixel_6 is the newest device that ships with the runner's command-line-tools. Update this note if that changes.",
-    "dropped_api26": "android-8-api-26-pixel-2 removed 2026-07-13: SDK Platform 26 image download is flaky on ubuntu-latest (ZipFile corruption), and on the runs where it does boot the SSAI leg hangs the job to the 45-min timeout. Re-add if API 26 coverage becomes necessary."
+    "dropped_api26": "android-8-api-26-pixel-2 removed 2026-07-13: SDK Platform 26 image download is flaky on ubuntu-latest (ZipFile corruption), and on the runs where it does boot the SSAI leg hangs the job to the 45-min timeout. Re-add if API 26 coverage becomes necessary.",
+    "min_version_431": "Floor is 4.3.1 because playback-build.yml links the *published* NRVA artifact per version, and the fork sample app uses APIs (NRAdConfig, enable/isQoeAggregate, withCollectorAddress) that only exist from 4.3.1 onward. withCollectorAddress in particular is how legs route to the staging collector — a real <4.3.1 build can't reach the staging account. Lowering the floor requires per-version source shims for those APIs."
   }
 }
