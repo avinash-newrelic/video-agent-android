@@ -275,6 +275,25 @@ jobs:
             legs_with_data=$(( total_expected > 0 ? 1 : 0 ))
             echo "**Aggregate:** ${total_ok} / ${total_expected} scenarios succeeded across the matrix. ${missing} (version × leg) cells produced no artifact."
 
+            # viewId table — one row per (version, leg, scenario). Columns come
+            # straight from SUMMARY.txt (status|elapsed|scenario|viewId), so a
+            # reviewer can click from a run to the exact New Relic session.
+            echo ""
+            echo "## viewIds"
+            echo ""
+            echo "| version | leg | scenario | status | viewId |"
+            echo "|---|---|---|---|---|"
+            for v in $(echo "$VERSIONS" | jq -r '.[]'); do
+              for tag in $(echo "$LEGS" | jq -r '.[].tag'); do
+                f="artifacts/playback-${v}-${tag}/SUMMARY.txt"
+                [ -f "$f" ] || continue
+                # awk over the 4-field pipe format; missing viewId prints as
+                # the literal "(not-found)" the test job already wrote.
+                awk -F'|' -v v="$v" -v tag="$tag" \
+                  '{ printf "| %s | %s | %s | %s | `%s` |\n", v, tag, $3, $1, ($4==""?"(none)":$4) }' "$f"
+              done
+            done
+
             echo ""
             echo "## Sample NRQL"
             echo ""

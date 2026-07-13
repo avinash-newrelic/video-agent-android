@@ -87,8 +87,16 @@ jobs:
             sed -i "/include ':${M}'/d" settings.gradle
           done
 
+          # The published artifacts live on JitPack, but only `buildscript`
+          # lists it — `allprojects.repositories` (where app deps resolve) has
+          # just google()+mavenCentral(). Add jitpack after every mavenCentral
+          # so the swapped coordinates resolve. Duplicate in buildscript is a
+          # harmless no-op.
+          sed -i "s#mavenCentral()#mavenCentral()\n        maven { url 'https://jitpack.io' }#g" build.gradle
+
           echo "--- app/build.gradle NRVA deps ---"; grep "$GRP" app/build.gradle
           echo "--- settings.gradle ---"; cat settings.gradle
+          echo "--- repositories ---"; grep -n "jitpack" build.gradle
 
       - name: Gradle cache
         uses: actions/cache@v4
